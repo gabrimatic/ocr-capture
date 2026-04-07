@@ -7,6 +7,42 @@ SOURCE="$SCRIPT_DIR/ocr-capture.swift"
 SKHDRC="$HOME/.skhdrc"
 BINDING="cmd + shift - e : $BINARY"
 
+# --- Uninstall ---
+
+if [[ "${1:-}" == "--uninstall" ]]; then
+    echo "=== OCR Capture Uninstall ==="
+    echo
+
+    # Remove binding from skhdrc
+    if [ -f "$SKHDRC" ]; then
+        sed -i '' '/ocr-capture/d' "$SKHDRC"
+        sed -i '' '/# OCR Capture:/d' "$SKHDRC"
+        # Remove trailing blank lines
+        sed -i '' -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$SKHDRC"
+        echo "  Removed hotkey binding from $SKHDRC"
+
+        # Restart skhd if it has other bindings, otherwise stop it
+        if grep -qE '^[^#]' "$SKHDRC" 2>/dev/null; then
+            skhd --restart-service 2>/dev/null || true
+            echo "  Restarted skhd (other bindings remain)"
+        else
+            echo "  No other bindings in $SKHDRC"
+        fi
+    fi
+
+    # Remove compiled binary
+    rm -f "$BINARY"
+    echo "  Removed binary"
+
+    echo
+    echo "Done. Source files are untouched. To fully remove:"
+    echo "  rm -rf $SCRIPT_DIR"
+    echo "  brew uninstall skhd  # only if nothing else uses it"
+    exit 0
+fi
+
+# --- Install ---
+
 echo "=== OCR Capture Setup ==="
 echo
 
@@ -25,6 +61,12 @@ echo "  Built: $BINARY"
 
 # 3. Install skhd if needed
 if ! command -v skhd &>/dev/null; then
+    if ! command -v brew &>/dev/null; then
+        echo "Error: Homebrew is required to install skhd."
+        echo "  Install Homebrew: https://brew.sh"
+        echo "  Then run this script again."
+        exit 1
+    fi
     echo "Installing skhd..."
     brew install koekeishiya/formulae/skhd
 fi
@@ -32,12 +74,22 @@ fi
 # 4. Add hotkey binding
 if [ -f "$SKHDRC" ]; then
     if grep -qF "ocr-capture" "$SKHDRC"; then
-        echo "  Hotkey already configured in $SKHDRC"
+        # Update existing binding path in case the project moved
+        sed -i '' "s|cmd + shift - e : .*ocr-capture.*|$BINDING|" "$SKHDRC"
+        echo "  Updated hotkey binding in $SKHDRC"
     else
-        echo "" >> "$SKHDRC"
-        echo "# OCR Capture: select screen region, OCR it, copy text to clipboard" >> "$SKHDRC"
-        echo "$BINDING" >> "$SKHDRC"
-        echo "  Added hotkey binding to $SKHDRC"
+        # Check for conflicting cmd+shift+e binding
+        if grep -qE '^cmd \+ shift - e' "$SKHDRC"; then
+            echo "  Warning: ⌘⇧E is already bound to something else in $SKHDRC"
+            echo "  Current binding:"
+            grep -E '^cmd \+ shift - e' "$SKHDRC" | sed 's/^/    /'
+            echo "  OCR Capture was NOT added. Edit $SKHDRC manually to resolve."
+        else
+            echo "" >> "$SKHDRC"
+            echo "# OCR Capture: select screen region, OCR it, copy text to clipboard" >> "$SKHDRC"
+            echo "$BINDING" >> "$SKHDRC"
+            echo "  Added hotkey binding to $SKHDRC"
+        fi
     fi
 else
     echo "# OCR Capture: select screen region, OCR it, copy text to clipboard" > "$SKHDRC"
@@ -46,11 +98,11 @@ else
 fi
 
 # 5. Start or restart skhd
-if launchctl list | grep -q skhd; then
-    skhd --restart-service
+if launchctl list 2>/dev/null | grep -q skhd; then
+    skhd --restart-service 2>/dev/null || true
     echo "  Restarted skhd"
 else
-    skhd --start-service
+    skhd --start-service 2>/dev/null || true
     echo "  Started skhd"
 fi
 

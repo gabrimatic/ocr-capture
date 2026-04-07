@@ -25,7 +25,7 @@ One command. Compiles the binary, installs [skhd](https://github.com/koekeishiya
 |--------|-----|
 | Capture and OCR | **⌘⇧E** |
 
-Press the shortcut, drag to select a region, release. The recognized text is in your clipboard.
+Press the shortcut, drag to select a region, release. The recognized text is in your clipboard. A notification confirms success.
 
 ---
 
@@ -33,8 +33,10 @@ Press the shortcut, drag to select a region, release. The recognized text is in 
 
 - **Screen region OCR** via Apple Vision. Select any area, get the text.
 - **Automatic language detection**. English, German, Persian, Arabic, Chinese, Japanese, Korean, and every other language Vision supports.
+- **Reading order preservation**. Text is sorted top-to-bottom, left-to-right, matching the visual layout.
 - **Clipboard output**. Recognized text goes straight to the clipboard. No file saved.
 - **Accurate mode** with language correction. Uses Vision Revision 3 for the best available recognition quality.
+- **Feedback**. Sound and macOS notification on success, failure, or empty result.
 - **Global hotkey** via skhd. Works from any app, any context.
 
 ---
@@ -42,10 +44,11 @@ Press the shortcut, drag to select a region, release. The recognized text is in 
 ## How It Works
 
 1. ⌘⇧E triggers macOS `screencapture -i` (interactive region selection)
-2. The captured image is loaded in memory
-3. Apple Vision `VNRecognizeTextRequest` runs OCR (Revision 3, accurate mode, automatic language detection)
-4. Extracted text is copied to the clipboard via `NSPasteboard`
-5. The temporary screenshot is deleted
+2. The captured image loads via `CGImageSource` (direct, no intermediate conversions)
+3. Apple Vision `VNRecognizeTextRequest` runs OCR with a 15-second timeout
+4. Results are sorted by bounding box position to match reading order
+5. Extracted text is copied to the clipboard via `NSPasteboard`
+6. The temporary file is deleted, a notification confirms the result
 
 The entire pipeline runs locally. Nothing touches the network.
 
@@ -55,6 +58,7 @@ The entire pipeline runs locally. Nothing touches the network.
 
 - macOS 13+ (Ventura or later)
 - Xcode Command Line Tools (`xcode-select --install`)
+- [Homebrew](https://brew.sh) (for installing skhd)
 - [skhd](https://github.com/koekeishiya/skhd) for the global keyboard shortcut (installed by `setup.sh`)
 - Accessibility permission for skhd (System Settings > Privacy & Security > Accessibility)
 
@@ -88,18 +92,20 @@ Zero network calls. Everything runs on-device.
 | OCR | Apple Vision framework (in-process) |
 | Clipboard | NSPasteboard (local) |
 
-Temporary screenshots are deleted immediately after OCR. No data is stored, logged, or transmitted.
+Temporary screenshots use `mkstemp` for safe file creation and are deleted immediately after OCR. No data is stored, logged, or transmitted.
 
 ---
 
 ## Architecture
 
 ```
-ocr-capture (single Swift binary, ~70 lines)
+ocr-capture (single Swift binary)
   ├── screencapture -i (interactive region selection)
-  ├── NSImage / NSBitmapImageRep (image loading)
-  ├── VNRecognizeTextRequest (Vision OCR, Revision 3)
-  └── NSPasteboard (clipboard output)
+  ├── CGImageSource (direct image loading)
+  ├── VNRecognizeTextRequest (Vision OCR, Revision 3, 15s timeout)
+  ├── Bounding box sort (reading order: top→bottom, left→right)
+  ├── NSPasteboard (clipboard output)
+  └── UNUserNotificationCenter + NSSound (feedback)
 
 skhd (hotkey daemon)
   └── ~/.skhdrc → binds ⌘⇧E to the binary
@@ -123,7 +129,21 @@ skhd (hotkey daemon)
 <details>
 <summary><strong>No text detected</strong></summary>
 
-Vision works best with clear, readable text. Very small text, heavy stylization, or low-contrast images may yield partial or empty results. Try selecting a tighter region around the text.
+Vision works best with clear, readable text. Very small text, heavy stylization, or low-contrast images may yield partial or empty results. Try selecting a tighter region around the text. A notification will tell you when no text was found.
+
+</details>
+
+<details>
+<summary><strong>OCR timed out</strong></summary>
+
+Very large screen regions (e.g., an entire 4K display) may take longer to process. The default timeout is 15 seconds. Try selecting a smaller region focused on the text you need.
+
+</details>
+
+<details>
+<summary><strong>Empty or black capture</strong></summary>
+
+This usually means Screen Recording permission is missing. Grant it in System Settings > Privacy & Security > Screen Recording. The notification will suggest this if it detects an empty capture.
 
 </details>
 
@@ -137,6 +157,12 @@ Vision's automatic language detection handles most cases. For mixed-language con
 ---
 
 ## Uninstall
+
+```bash
+./setup.sh --uninstall
+```
+
+Or manually:
 
 ```bash
 skhd --stop-service
