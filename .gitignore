@@ -1,0 +1,16 @@
+# Compiled binary
+ocr-capture
+!ocr-capture.swift
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# AI instructions
+CLAUDE.md
+AGENTS.md
