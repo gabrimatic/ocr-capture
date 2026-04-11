@@ -1,16 +1,17 @@
 import Cocoa
 import Vision
-import UserNotifications
 
 // MARK: - Notification
 
 func notify(_ title: String, _ body: String) {
-    let content = UNMutableNotificationContent()
-    content.title = title
-    content.body = body
-    content.sound = .default
-    let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-    UNUserNotificationCenter.current().add(request)
+    let escaped_title = title.replacingOccurrences(of: "\"", with: "\\\"")
+    let escaped_body = body.replacingOccurrences(of: "\"", with: "\\\"")
+    let script = "display notification \"\(escaped_body)\" with title \"\(escaped_title)\""
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    task.arguments = ["-e", script]
+    try? task.run()
+    task.waitUntilExit()
 }
 
 func playSound(_ name: String) {
@@ -154,5 +155,3 @@ let lineCount = text.components(separatedBy: "\n").count
 playSound("Pop")
 notify("OCR Capture", "Copied \(lineCount) line\(lineCount == 1 ? "" : "s") to clipboard.")
 
-// Give notification time to fire
-RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.3))
