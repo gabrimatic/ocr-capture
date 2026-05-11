@@ -7,6 +7,17 @@ SOURCE="$SCRIPT_DIR/ocr-capture.swift"
 SKHDRC="$HOME/.skhdrc"
 BINDING="cmd + shift - e : $BINARY"
 
+remove_path() {
+    local path="$1"
+    [ -e "$path" ] || return 0
+
+    if command -v trash &>/dev/null; then
+        trash "$path" 2>/dev/null || rm -f "$path"
+    else
+        rm -f "$path"
+    fi
+}
+
 # --- Uninstall ---
 
 if [[ "${1:-}" == "--uninstall" ]]; then
@@ -31,12 +42,12 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     fi
 
     # Remove compiled binary
-    rm -f "$BINARY"
+    remove_path "$BINARY"
     echo "  Removed binary"
 
     echo
     echo "Done. Source files are untouched. To fully remove:"
-    echo "  rm -rf $SCRIPT_DIR"
+    echo "  trash \"$SCRIPT_DIR\"  # or remove the folder manually"
     echo "  brew uninstall skhd  # only if nothing else uses it"
     exit 0
 fi
@@ -56,7 +67,7 @@ fi
 
 # 2. Compile
 echo "Compiling ocr-capture..."
-swiftc -O -o "$BINARY" "$SOURCE" -framework Cocoa -framework Vision
+xcrun swiftc -O -o "$BINARY" "$SOURCE" -framework Cocoa -framework Vision
 echo "  Built: $BINARY"
 
 # 3. Install skhd if needed

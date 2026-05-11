@@ -10,7 +10,3 @@ ocr-capture
 .idea/
 .vscode/
 *.swp
-
-# AI instructions
-CLAUDE.md
-AGENTS.md
