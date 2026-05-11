@@ -5,7 +5,7 @@
 [![Apple Silicon](https://img.shields.io/badge/Apple_Silicon-native-blue.svg)]()
 [![Swift](https://img.shields.io/badge/Swift-5.9+-orange.svg)]()
 
-**Select any region of your screen, extract the text, copy it to your clipboard. One keystroke.**
+**Select any region of your screen, or pass in an image file, extract the text, copy it to your clipboard. One keystroke.**
 
 Uses Apple's Vision framework (the same engine behind Live Text) for accurate, on-device OCR. Supports automatic language detection across all languages Vision recognizes. No network calls, no dependencies, no temp files kept.
 
@@ -35,6 +35,7 @@ Press the shortcut, drag to select a region, release. The recognized text is in 
 - **Automatic language detection**. English, German, Persian, Arabic, Chinese, Japanese, Korean, and every other language Vision supports.
 - **Reading order preservation**. Text is sorted top-to-bottom, left-to-right, matching the visual layout.
 - **Clipboard output**. Recognized text goes straight to the clipboard. No file saved.
+- **File input and stdout output**. OCR existing screenshots from scripts without starting interactive capture.
 - **Accurate mode** with language correction. Uses Vision Revision 3 for the best available recognition quality.
 - **Feedback**. Sound and macOS notification on success, failure, or empty result.
 - **Global hotkey** via skhd. Works from any app, any context.
@@ -50,6 +51,8 @@ Press the shortcut, drag to select a region, release. The recognized text is in 
 5. Extracted text is copied to the clipboard via `NSPasteboard`
 6. The temporary file is deleted, a notification confirms the result
 
+For `--file`, the pipeline starts from the supplied image path and skips screen capture.
+
 The entire pipeline runs locally. Nothing touches the network.
 
 ---
@@ -61,6 +64,7 @@ The entire pipeline runs locally. Nothing touches the network.
 - [Homebrew](https://brew.sh) (for installing skhd)
 - [skhd](https://github.com/koekeishiya/skhd) for the global keyboard shortcut (installed by `setup.sh`)
 - Accessibility permission for skhd (System Settings > Privacy & Security > Accessibility)
+- Screen Recording permission for interactive capture (System Settings > Privacy & Security > Screen Recording)
 
 ---
 
@@ -79,6 +83,39 @@ ctrl + shift - o : /path/to/ocr-capture/ocr-capture
 Restart skhd after changes: `skhd --restart-service`
 
 See the [skhd documentation](https://github.com/koekeishiya/skhd) for key syntax.
+
+---
+
+## CLI Usage
+
+Interactive capture:
+
+```bash
+./ocr-capture
+```
+
+OCR an existing image and print the text:
+
+```bash
+./ocr-capture --file screenshot.png --stdout --no-copy --quiet
+```
+
+Options:
+
+```text
+Usage: ocr-capture [options]
+
+Select a screen region, run OCR, and copy the recognized text to the clipboard.
+With --file, OCR an existing image instead of starting an interactive capture.
+
+Options:
+  -f, --file PATH       OCR an existing image file.
+      --stdout          Print recognized text to stdout.
+      --no-copy         Do not copy recognized text to the clipboard.
+      --quiet           Suppress sounds and notifications.
+      --timeout SECONDS OCR timeout in seconds. Default: 15.
+  -h, --help            Show this help.
+```
 
 ---
 
@@ -105,7 +142,7 @@ ocr-capture (single Swift binary)
   ├── VNRecognizeTextRequest (Vision OCR, Revision 3, 15s timeout)
   ├── Bounding box sort (reading order: top→bottom, left→right)
   ├── NSPasteboard (clipboard output)
-  └── UNUserNotificationCenter + NSSound (feedback)
+  └── osascript notification + NSSound (feedback)
 
 skhd (hotkey daemon)
   └── ~/.skhdrc → binds ⌘⇧E to the binary
@@ -136,7 +173,7 @@ Vision works best with clear, readable text. Very small text, heavy stylization,
 <details>
 <summary><strong>OCR timed out</strong></summary>
 
-Very large screen regions (e.g., an entire 4K display) may take longer to process. The default timeout is 15 seconds. Try selecting a smaller region focused on the text you need.
+Very large screen regions (e.g., an entire 4K display) may take longer to process. The default timeout is 15 seconds. Try selecting a smaller region focused on the text you need, or use `--timeout SECONDS` for file-based OCR.
 
 </details>
 
@@ -167,7 +204,7 @@ Or manually:
 ```bash
 skhd --stop-service
 brew uninstall skhd
-rm -rf ~/Developer/Projects/ocr-capture
+trash ~/Developer/Projects/ocr-capture  # or remove the folder manually
 # Remove the ⌘⇧E binding from ~/.skhdrc if you have other bindings,
 # or delete ~/.skhdrc entirely if ocr-capture was the only entry
 ```

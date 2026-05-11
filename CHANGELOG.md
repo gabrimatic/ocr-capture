@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- Non-interactive image OCR with `--file`, `--stdout`, `--no-copy`, `--quiet`, and `--timeout`
+- Repeatable CLI tests that verify help output, missing-file handling, and end-to-end OCR from a generated image fixture
+- `make build`, `make test`, `make install`, and `make uninstall` targets
+- macOS GitHub Actions workflow for pull request and main-branch verification
+
+### Changed
+
+- Setup now compiles through `xcrun swiftc` for a more reliable Command Line Tools path
+- Notification text escaping now handles backslashes and quotes on the existing `osascript` notification path
+
+---
+
 ## [1.1.0] - 2026-04-07
 
 ### Added
