@@ -5,7 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY="$SCRIPT_DIR/ocr-capture"
 SOURCE="$SCRIPT_DIR/ocr-capture.swift"
 SKHDRC="$HOME/.skhdrc"
-BINDING="cmd + shift - e : $BINARY"
+# skhd runs bindings via `$SHELL -c`, so the path must be shell-quoted, not
+# just double-quoted -- double quotes still allow $(...) / `...` to execute.
+BINARY_Q="$(printf '%q' "$BINARY")"
+BINDING="cmd + shift - e : $BINARY_Q"
 
 remove_path() {
     local path="$1"
@@ -26,8 +29,38 @@ if [[ "${1:-}" == "--uninstall" ]]; then
 
     # Remove binding from skhdrc
     if [ -f "$SKHDRC" ]; then
-        sed -i '' '/ocr-capture/d' "$SKHDRC"
-        sed -i '' '/# OCR Capture:/d' "$SKHDRC"
+        # Two passes, both precise about what they touch:
+        #  1) our exact marker comment plus the line right after it (how
+        #     this script always writes the binding).
+        #  2) any remaining non-comment line whose command (text after the
+        #     last ':', quotes stripped) is exactly the ocr-capture binary --
+        #     covers older/custom-hotkey installs without the marker comment.
+        # Never matches on a bare substring, so a binding like
+        # `alt - r : open "/Users/me/notes/ocr-capture-ideas.md"` survives.
+        tmp_skhdrc="$(mktemp)"
+        awk '
+            skip_next { skip_next = 0; next }
+            /^# OCR Capture: select screen region, OCR it, copy text to clipboard$/ { skip_next = 1; next }
+            { print }
+        ' "$SKHDRC" | awk -v sq="'" -v dq='"' '
+            /^[[:space:]]*#/ { print; next }
+            {
+                n = length($0); pos = 0
+                for (i = 1; i <= n; i++) if (substr($0, i, 1) == ":") pos = i
+                if (pos > 0) {
+                    cmd = substr($0, pos + 1)
+                    gsub(/^[ \t]+/, "", cmd)
+                    gsub(/[ \t]+$/, "", cmd)
+                    if ((substr(cmd, 1, 1) == sq && substr(cmd, length(cmd), 1) == sq) ||
+                        (substr(cmd, 1, 1) == dq && substr(cmd, length(cmd), 1) == dq)) {
+                        cmd = substr(cmd, 2, length(cmd) - 2)
+                    }
+                    if (cmd ~ /(^|\/)ocr-capture$/) next
+                }
+                print
+            }
+        ' > "$tmp_skhdrc"
+        mv "$tmp_skhdrc" "$SKHDRC"
         # Remove trailing blank lines
         sed -i '' -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$SKHDRC"
         echo "  Removed hotkey binding from $SKHDRC"
@@ -85,15 +118,50 @@ fi
 # 4. Add hotkey binding
 if [ -f "$SKHDRC" ]; then
     if grep -qF "ocr-capture" "$SKHDRC"; then
-        # Update existing binding path in case the project moved
-        sed -i '' "s|cmd + shift - e : .*ocr-capture.*|$BINDING|" "$SKHDRC"
-        echo "  Updated hotkey binding in $SKHDRC"
+        # Update existing binding path in case the project moved, preserving
+        # a user-customized hotkey (everything before the last ':'). Only
+        # touches a line whose command is exactly the ocr-capture binary
+        # (quotes stripped) -- never a line that merely mentions the string
+        # "ocr-capture" elsewhere. The new path is read from the environment
+        # (not -v) because awk's -v reprocesses backslash escapes, which
+        # would mangle the %q-quoted path.
+        tmp_skhdrc="$(mktemp)"
+        BINARY_PATH="$BINARY_Q" awk -v sq="'" -v dq='"' '
+            /^[[:space:]]*#/ { print; next }
+            {
+                n = length($0); pos = 0
+                for (i = 1; i <= n; i++) if (substr($0, i, 1) == ":") pos = i
+                if (pos > 0) {
+                    cmd = substr($0, pos + 1)
+                    gsub(/^[ \t]+/, "", cmd)
+                    gsub(/[ \t]+$/, "", cmd)
+                    bare = cmd
+                    if ((substr(bare, 1, 1) == sq && substr(bare, length(bare), 1) == sq) ||
+                        (substr(bare, 1, 1) == dq && substr(bare, length(bare), 1) == dq)) {
+                        bare = substr(bare, 2, length(bare) - 2)
+                    }
+                    if (bare ~ /(^|\/)ocr-capture$/) {
+                        print substr($0, 1, pos) " " ENVIRON["BINARY_PATH"]
+                        next
+                    }
+                }
+                print
+            }
+        ' "$SKHDRC" > "$tmp_skhdrc"
+
+        if cmp -s "$SKHDRC" "$tmp_skhdrc"; then
+            rm -f "$tmp_skhdrc"
+            echo "  Hotkey binding already up to date"
+        else
+            mv "$tmp_skhdrc" "$SKHDRC"
+            echo "  Updated hotkey binding in $SKHDRC"
+        fi
     else
-        # Check for conflicting cmd+shift+e binding
-        if grep -qE '^cmd \+ shift - e' "$SKHDRC"; then
+        # Check for conflicting cmd+shift+e binding (tolerate loose whitespace)
+        if grep -qE '^cmd[[:space:]]*\+[[:space:]]*shift[[:space:]]*-[[:space:]]*e' "$SKHDRC"; then
             echo "  Warning: ⌘⇧E is already bound to something else in $SKHDRC"
             echo "  Current binding:"
-            grep -E '^cmd \+ shift - e' "$SKHDRC" | sed 's/^/    /'
+            grep -E '^cmd[[:space:]]*\+[[:space:]]*shift[[:space:]]*-[[:space:]]*e' "$SKHDRC" | sed 's/^/    /'
             echo "  OCR Capture was NOT added. Edit $SKHDRC manually to resolve."
         else
             echo "" >> "$SKHDRC"
