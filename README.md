@@ -36,7 +36,7 @@ Press the shortcut, drag to select a region, release. The recognized text is in 
 - **Reading order preservation**. Text is sorted top-to-bottom, left-to-right, matching the visual layout.
 - **Clipboard output**. Recognized text goes straight to the clipboard. No file saved.
 - **File input and stdout output**. OCR existing screenshots from scripts without starting interactive capture.
-- **Accurate mode** with language correction. Uses Vision Revision 3 for the best available recognition quality.
+- **Accurate mode** with language correction, plus an automatic fast-mode fallback when the accurate model is still warming up (for example right after a macOS update), so a capture never fails outright.
 - **Feedback**. Sound and macOS notification on success, failure, or empty result.
 - **Global hotkey** via skhd. Works from any app, any context.
 
@@ -46,8 +46,8 @@ Press the shortcut, drag to select a region, release. The recognized text is in 
 
 1. ⌘⇧E triggers macOS `screencapture -i` (interactive region selection)
 2. The captured image loads via `CGImageSource` (direct, no intermediate conversions)
-3. Apple Vision `VNRecognizeTextRequest` runs OCR with a 15-second timeout
-4. Results are sorted by bounding box position to match reading order
+3. Apple Vision `VNRecognizeTextRequest` runs accurate OCR with a 15-second timeout; if the accurate model is still compiling (first use after a macOS update), it falls back to fast recognition so you still get your text, and interactive captures finish warming the accurate model in the background for the next run
+4. Results are clustered into visual rows and sorted to match reading order
 5. Extracted text is copied to the clipboard via `NSPasteboard`
 6. The temporary file is deleted, a notification confirms the result
 
@@ -112,10 +112,12 @@ Options:
   -f, --file PATH       OCR an existing image file.
       --stdout          Print recognized text to stdout.
       --no-copy         Do not copy recognized text to the clipboard.
-      --quiet           Suppress sounds and notifications.
-      --timeout SECONDS OCR timeout in seconds. Default: 15.
+      --quiet           Suppress sounds and notifications (alias: --no-notify).
+      --timeout SECONDS OCR timeout in seconds (1-3600). Default: 15.
   -h, --help            Show this help.
 ```
+
+Exit codes: `0` success (including "no text found" and a cancelled capture), `1` runtime error (capture, loading, OCR, or clipboard failure), `2` usage error.
 
 ---
 
@@ -139,8 +141,8 @@ Temporary screenshots use `mkstemp` for safe file creation and are deleted immed
 ocr-capture (single Swift binary)
   ├── screencapture -i (interactive region selection)
   ├── CGImageSource (direct image loading)
-  ├── VNRecognizeTextRequest (Vision OCR, Revision 3, 15s timeout)
-  ├── Bounding box sort (reading order: top→bottom, left→right)
+  ├── VNRecognizeTextRequest (Vision OCR, accurate + fast fallback, 15s timeout)
+  ├── Row clustering sort (reading order: top→bottom, left→right)
   ├── NSPasteboard (clipboard output)
   └── osascript notification + NSSound (feedback)
 
@@ -173,7 +175,9 @@ Vision works best with clear, readable text. Very small text, heavy stylization,
 <details>
 <summary><strong>OCR timed out</strong></summary>
 
-Very large screen regions (e.g., an entire 4K display) may take longer to process. The default timeout is 15 seconds. Try selecting a smaller region focused on the text you need, or use `--timeout SECONDS` for file-based OCR.
+Very large screen regions (e.g., an entire 4K display) may take longer to process. The default timeout is 15 seconds and applies to both interactive and file-based OCR; change it with `--timeout SECONDS`.
+
+Right after a macOS update, the first OCR run can stall while macOS compiles the accurate recognition model on-device. When that happens the tool automatically falls back to fast recognition (you still get your text), and an interactive capture keeps warming the accurate model in the background — the next capture uses accurate mode again.
 
 </details>
 

@@ -22,6 +22,7 @@ enum OCRCaptureError: Error {
     case emptyImage
     case ocrTimedOut(Int)
     case ocrFailed(String)
+    case clipboardFailed
 
     var message: String {
         switch self {
@@ -39,6 +40,8 @@ enum OCRCaptureError: Error {
             return "OCR timed out after \(seconds) seconds."
         case .ocrFailed(let message):
             return "OCR failed: \(message)"
+        case .clipboardFailed:
+            return "Failed to copy text to the clipboard."
         }
     }
 
@@ -52,6 +55,8 @@ enum OCRCaptureError: Error {
     }
 }
 
+let maxTimeoutSeconds = 3600
+
 let usage = """
 Usage: ocr-capture [options]
 
@@ -62,8 +67,8 @@ Options:
   -f, --file PATH       OCR an existing image file.
       --stdout          Print recognized text to stdout.
       --no-copy         Do not copy recognized text to the clipboard.
-      --quiet           Suppress sounds and notifications.
-      --timeout SECONDS OCR timeout in seconds. Default: 15.
+      --quiet           Suppress sounds and notifications (alias: --no-notify).
+      --timeout SECONDS OCR timeout in seconds (1-\(maxTimeoutSeconds)). Default: 15.
   -h, --help            Show this help.
 """
 
@@ -84,6 +89,9 @@ func parseArguments(_ rawArguments: [String]) throws -> Configuration {
                   !arguments[index].hasPrefix("-") else {
                 throw OCRCaptureError.usage("Missing value for \(argument).")
             }
+            guard configuration.imagePath == nil else {
+                throw OCRCaptureError.usage("Multiple image paths specified.")
+            }
             configuration.imagePath = arguments[index]
         case "--stdout":
             configuration.printToStdout = true
@@ -96,8 +104,8 @@ func parseArguments(_ rawArguments: [String]) throws -> Configuration {
             guard index < arguments.count else {
                 throw OCRCaptureError.usage("Missing value for --timeout.")
             }
-            guard let seconds = Int(arguments[index]), seconds > 0 else {
-                throw OCRCaptureError.usage("Timeout must be a positive integer.")
+            guard let seconds = Int(arguments[index]), seconds > 0, seconds <= maxTimeoutSeconds else {
+                throw OCRCaptureError.usage("Timeout must be between 1 and \(maxTimeoutSeconds) seconds.")
             }
             configuration.timeoutSeconds = seconds
         default:
@@ -108,7 +116,7 @@ func parseArguments(_ rawArguments: [String]) throws -> Configuration {
             if configuration.imagePath == nil {
                 configuration.imagePath = argument
             } else {
-                throw OCRCaptureError.usage("Unexpected argument: \(argument).")
+                throw OCRCaptureError.usage("Multiple image paths specified.")
             }
         }
 
@@ -127,6 +135,8 @@ func notify(_ title: String, _ body: String, quiet: Bool) {
         let escaped = value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
         return "\"\(escaped)\""
     }
 
@@ -134,8 +144,12 @@ func notify(_ title: String, _ body: String, quiet: Bool) {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
     task.arguments = ["-e", script]
-    try? task.run()
-    task.waitUntilExit()
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        // Notifications are best-effort; a missing osascript must not crash the tool.
+    }
 }
 
 func playSound(_ name: String, quiet: Bool) {
@@ -175,7 +189,7 @@ func makeTemporaryPNGPath() -> String {
     let descriptor = mkstemps(&buffer, 4)
 
     guard descriptor != -1 else {
-        return NSTemporaryDirectory() + "ocr_capture_\(ProcessInfo.processInfo.processIdentifier).png"
+        return NSTemporaryDirectory() + "ocr_capture_\(UUID().uuidString).png"
     }
 
     close(descriptor)
@@ -232,70 +246,179 @@ func loadImage(at url: URL) throws -> CGImage {
     return cgImage
 }
 
+// MARK: - Stdout hygiene
+
+// Vision's model loader prints diagnostics directly to stdout, which would
+// corrupt --stdout output for scripts. Point fd 1 at /dev/null for the rest of
+// the process and hand back the original stdout for writing recognized text.
+func protectStdout() -> FileHandle {
+    let saved = dup(STDOUT_FILENO)
+    guard saved != -1 else {
+        return .standardOutput
+    }
+
+    let devNull = open("/dev/null", O_WRONLY)
+    if devNull != -1 {
+        dup2(devNull, STDOUT_FILENO)
+        close(devNull)
+    }
+
+    return FileHandle(fileDescriptor: saved, closeOnDealloc: false)
+}
+
 // MARK: - OCR
 
 func recognizedText(from observations: [VNRecognizedTextObservation]) -> String {
-    let sorted = observations.sorted { a, b in
-        guard let textA = a.topCandidates(1).first,
-              let textB = b.topCandidates(1).first else {
-            return false
-        }
-
-        let rectA = (try? textA.boundingBox(for: textA.string.startIndex..<textA.string.endIndex))?.boundingBox ?? a.boundingBox
-        let rectB = (try? textB.boundingBox(for: textB.string.startIndex..<textB.string.endIndex))?.boundingBox ?? b.boundingBox
-
-        let rowTolerance = max(rectA.height, rectB.height) * 0.45
-        if abs(rectA.midY - rectB.midY) > rowTolerance {
-            return rectA.midY > rectB.midY
-        }
-
-        return rectA.minX < rectB.minX
+    struct Line {
+        let text: String
+        let box: CGRect
     }
 
-    return sorted
-        .compactMap { $0.topCandidates(1).first?.string }
+    let lines: [Line] = observations.compactMap { observation in
+        guard let candidate = observation.topCandidates(1).first, !candidate.string.isEmpty else {
+            return nil
+        }
+
+        let range = candidate.string.startIndex..<candidate.string.endIndex
+        let box = (try? candidate.boundingBox(for: range))?.boundingBox ?? observation.boundingBox
+        return Line(text: candidate.string, box: box)
+    }
+
+    // Vision coordinates are normalized with the origin at the bottom-left, so a
+    // larger midY is closer to the top of the image. Sort by a deterministic
+    // total order first, then cluster into visual rows; a tolerance-based
+    // comparator fed straight to sorted(by:) would not be a strict weak ordering.
+    let byVertical = lines.sorted { a, b in
+        if a.box.midY != b.box.midY { return a.box.midY > b.box.midY }
+        if a.box.minX != b.box.minX { return a.box.minX < b.box.minX }
+        return a.text < b.text
+    }
+
+    var rows: [[Line]] = []
+    var currentRowMidY = CGFloat(0)
+
+    for line in byVertical {
+        if let previous = rows.last?.last {
+            let tolerance = max(line.box.height, previous.box.height) * 0.45
+            if abs(line.box.midY - currentRowMidY) <= tolerance {
+                rows[rows.count - 1].append(line)
+                let row = rows[rows.count - 1]
+                currentRowMidY = row.reduce(CGFloat(0)) { $0 + $1.box.midY } / CGFloat(row.count)
+                continue
+            }
+        }
+
+        rows.append([line])
+        currentRowMidY = line.box.midY
+    }
+
+    return rows
+        .flatMap { row in
+            row.sorted { a, b in
+                if a.box.minX != b.box.minX { return a.box.minX < b.box.minX }
+                return a.text < b.text
+            }
+        }
+        .map(\.text)
         .joined(separator: "\n")
 }
 
-func recognizeText(in image: CGImage, timeoutSeconds: Int) throws -> String {
+final class ErrorBox {
+    var error: Error?
+}
+
+struct PendingRecognition {
+    let request: VNRecognizeTextRequest
+    let semaphore: DispatchSemaphore
+    let errorBox: ErrorBox
+}
+
+// Test hook: the CLI test suite sets these to force the timeout/fallback paths
+// deterministically. Both are inert in normal use.
+func stallForTestingIfRequested(level: VNRequestTextRecognitionLevel) {
+    let environment = ProcessInfo.processInfo.environment
+    var keys = ["OCR_CAPTURE_TEST_STALL_MS"]
+    if level == .accurate {
+        keys.append("OCR_CAPTURE_TEST_STALL_ACCURATE_MS")
+    }
+
+    for key in keys {
+        if let value = environment[key], let milliseconds = UInt32(value), milliseconds > 0 {
+            Thread.sleep(forTimeInterval: TimeInterval(milliseconds) / 1000)
+        }
+    }
+}
+
+func startRecognition(image: CGImage, level: VNRequestTextRecognitionLevel) -> PendingRecognition {
     let request = VNRecognizeTextRequest()
-    request.recognitionLevel = .accurate
+    request.recognitionLevel = level
     request.usesLanguageCorrection = true
-    request.automaticallyDetectsLanguage = true
-    request.revision = VNRecognizeTextRequestRevision3
+    if level == .accurate {
+        request.automaticallyDetectsLanguage = true
+    }
 
-    let handler = VNImageRequestHandler(cgImage: image, options: [:])
-    let ocrQueue = DispatchQueue(label: "ocr")
+    let errorBox = ErrorBox()
     let semaphore = DispatchSemaphore(value: 0)
-    var ocrError: Error?
+    let handler = VNImageRequestHandler(cgImage: image, options: [:])
 
-    ocrQueue.async {
+    DispatchQueue.global(qos: .userInitiated).async {
+        stallForTestingIfRequested(level: level)
         do {
             try handler.perform([request])
         } catch {
-            ocrError = error
+            errorBox.error = error
         }
         semaphore.signal()
     }
 
-    let result = semaphore.wait(timeout: .now() + .seconds(timeoutSeconds))
-    if result == .timedOut {
+    return PendingRecognition(request: request, semaphore: semaphore, errorBox: errorBox)
+}
+
+struct RecognitionResult {
+    let text: String
+    let usedFastFallback: Bool
+    // Still-running accurate attempt after a fallback; waiting on it lets macOS
+    // finish compiling the accurate model so the next run succeeds first try.
+    let pendingWarmup: PendingRecognition?
+}
+
+func recognizeText(in image: CGImage, timeoutSeconds: Int) throws -> RecognitionResult {
+    let accurate = startRecognition(image: image, level: .accurate)
+
+    if accurate.semaphore.wait(timeout: .now() + .seconds(timeoutSeconds)) == .success {
+        if let error = accurate.errorBox.error {
+            throw OCRCaptureError.ocrFailed(error.localizedDescription)
+        }
+
+        let text = recognizedText(from: accurate.request.results ?? [])
+        return RecognitionResult(text: text, usedFastFallback: false, pendingWarmup: nil)
+    }
+
+    // Accurate recognition can stall far beyond any sane timeout while macOS
+    // compiles the model on first use after an OS update. Fast recognition uses
+    // an independent, quick-loading model, so degrade gracefully instead of
+    // failing outright.
+    let fast = startRecognition(image: image, level: .fast)
+    let fastTimeout = min(timeoutSeconds, 10)
+
+    guard fast.semaphore.wait(timeout: .now() + .seconds(fastTimeout)) == .success else {
         throw OCRCaptureError.ocrTimedOut(timeoutSeconds)
     }
 
-    if let error = ocrError {
+    if let error = fast.errorBox.error {
         throw OCRCaptureError.ocrFailed(error.localizedDescription)
     }
 
-    return recognizedText(from: request.results ?? [])
+    let text = recognizedText(from: fast.request.results ?? [])
+    return RecognitionResult(text: text, usedFastFallback: true, pendingWarmup: accurate)
 }
 
 // MARK: - Clipboard
 
-func copyToClipboard(_ text: String) {
+func copyToClipboard(_ text: String) -> Bool {
     let pasteboard = NSPasteboard.general
     pasteboard.clearContents()
-    pasteboard.setString(text, forType: .string)
+    return pasteboard.setString(text, forType: .string)
 }
 
 // MARK: - Main
@@ -315,53 +438,89 @@ if configuration.showHelp {
     exit(0)
 }
 
-do {
-    let capturedURL: URL?
-    let sourceURL: URL
+// exit() skips pending defer blocks, so the body runs in a function whose
+// early exits are returns (cleanup always runs) and the process exits once,
+// at the very end.
+var pendingWarmup: PendingRecognition?
 
-    if let imagePath = configuration.imagePath {
-        capturedURL = nil
-        sourceURL = try imageURL(from: imagePath)
-    } else {
-        guard let captureURL = try captureInteractiveRegion() else {
-            exit(0)
+func run() -> Int32 {
+    do {
+        let capturedURL: URL?
+        let sourceURL: URL
+
+        if let imagePath = configuration.imagePath {
+            capturedURL = nil
+            sourceURL = try imageURL(from: imagePath)
+        } else {
+            guard let captureURL = try captureInteractiveRegion() else {
+                return 0
+            }
+            capturedURL = captureURL
+            sourceURL = captureURL
         }
-        capturedURL = captureURL
-        sourceURL = captureURL
-    }
 
-    defer {
-        if let capturedURL {
-            try? FileManager.default.removeItem(at: capturedURL)
+        defer {
+            if let capturedURL {
+                try? FileManager.default.removeItem(at: capturedURL)
+            }
         }
-    }
 
-    let image = try loadImage(at: sourceURL)
-    let text = try recognizeText(in: image, timeoutSeconds: configuration.timeoutSeconds)
+        let cleanStdout = protectStdout()
+        let image = try loadImage(at: sourceURL)
+        let result = try recognizeText(in: image, timeoutSeconds: configuration.timeoutSeconds)
+        let text = result.text
 
-    guard !text.isEmpty else {
-        let message = configuration.imagePath == nil ? "No text found in selection." : "No text found in image."
+        if result.usedFastFallback {
+            fputs("Accurate OCR timed out; used fast recognition instead.\n", stderr)
+            pendingWarmup = result.pendingWarmup
+        }
+
+        guard !text.isEmpty else {
+            let message = configuration.imagePath == nil ? "No text found in selection." : "No text found in image."
+            playSound("Pop", quiet: configuration.quiet)
+            notify("OCR Capture", message, quiet: configuration.quiet)
+            return 0
+        }
+
+        if configuration.copyToClipboard {
+            guard copyToClipboard(text) else {
+                throw OCRCaptureError.clipboardFailed
+            }
+        }
+
+        if configuration.printToStdout {
+            cleanStdout.write(Data((text + "\n").utf8))
+        }
+
+        let lineCount = text.components(separatedBy: "\n").count
         playSound("Pop", quiet: configuration.quiet)
-        notify("OCR Capture", message, quiet: configuration.quiet)
-        exit(0)
+        let action = configuration.copyToClipboard ? "Copied" : "Recognized"
+        let suffix = configuration.copyToClipboard ? " to clipboard" : ""
+        notify("OCR Capture", "\(action) \(lineCount) line\(lineCount == 1 ? "" : "s")\(suffix).", quiet: configuration.quiet)
+        return 0
+    } catch let error as OCRCaptureError {
+        reportError(error, quiet: configuration.quiet)
+        return error.exitCode
+    } catch {
+        reportError(.ocrFailed(error.localizedDescription), quiet: configuration.quiet)
+        return 1
     }
-
-    if configuration.copyToClipboard {
-        copyToClipboard(text)
-    }
-
-    if configuration.printToStdout {
-        print(text)
-    }
-
-    let lineCount = text.components(separatedBy: "\n").count
-    playSound("Pop", quiet: configuration.quiet)
-    let action = configuration.copyToClipboard ? "Copied" : "Recognized"
-    let suffix = configuration.copyToClipboard ? " to clipboard" : ""
-    notify("OCR Capture", "\(action) \(lineCount) line\(lineCount == 1 ? "" : "s")\(suffix).", quiet: configuration.quiet)
-
-    RunLoop.current.run(until: Date(timeIntervalSinceNow: configuration.quiet ? 0 : 0.3))
-} catch let error as OCRCaptureError {
-    reportError(error, quiet: configuration.quiet)
-    exit(error.exitCode)
 }
+
+let exitCode = run()
+
+// NSSound.play() is asynchronous: every path that played a feedback sound needs
+// a moment of run-loop time before the process exits, or the sound is cut off.
+if !configuration.quiet {
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.3))
+}
+
+// Interactive captures are launched from a hotkey, so nothing waits on this
+// process: give an abandoned accurate attempt time to finish compiling its
+// model (macOS caches the result) so the next capture succeeds without
+// fallback. File mode exits immediately to keep scripted pipelines fast.
+if let warmup = pendingWarmup, configuration.imagePath == nil {
+    _ = warmup.semaphore.wait(timeout: .now() + .seconds(90))
+}
+
+exit(exitCode)
